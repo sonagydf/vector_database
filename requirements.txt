@@ -1,0 +1,11 @@
+faiss-cpu
+fastapi
+uvicorn
+numpy
+sentence-transformers
+transformers
+torch
+google-cloud-firestore
+google-cloud-storage
+python-dotenv
+faiss-cpu
