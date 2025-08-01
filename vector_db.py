@@ -1,39 +1,42 @@
-import faiss  # Ensure faiss is imported first
+import faiss
 import numpy as np
 import sqlite3
+import json
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import uvicorn
 import os
+import logging
 
-# Lifespan handler for startup and shutdown
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    init_index()
-    yield
-    save_index()
+    try:
+        init_db()
+        init_index()
+        yield
+        save_index()
+    except Exception as e:
+        logger.error(f"Error in lifespan: {e}")
+        raise
 
-# Initialize FastAPI app
 app = FastAPI(title="Vector Database API", lifespan=lifespan)
 
-# Root endpoint to avoid 404
 @app.get("/")
 async def root():
     return {"message": "Welcome to the Vector Database API. Visit /docs for API documentation."}
 
-# Initialize embedding model
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
-
-# FAISS index parameters
-dimension = 384  # MiniLM output dimension
+dimension = 384
 index_file = "faiss_index.bin"
 index = None
 db_file = "metadata.db"
 
-# Pydantic models
 class VectorInput(BaseModel):
     text: str
     metadata: dict
@@ -43,91 +46,151 @@ class QueryInput(BaseModel):
     top_k: int = 5
     metadata_filter: dict = None
 
-# Initialize SQLite database
 def init_db():
-    conn = sqlite3.connect(db_file)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS vectors
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  text TEXT NOT NULL,
-                  metadata TEXT)''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS vectors
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      text TEXT NOT NULL,
+                      metadata TEXT)''')
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+        raise
 
-# Initialize FAISS index with IndexIDMap
 def init_index():
     global index
-    if os.path.exists(index_file):
-        index = faiss.read_index(index_file)
-    else:
-        index = faiss.IndexIDMap(faiss.IndexFlatL2(dimension))
-    return index
+    try:
+        # Force new index for testing (remove later)
+        if os.path.exists(index_file):
+            os.remove(index_file)
+            logger.info("Deleted existing faiss_index.bin for clean start")
+        base_index = faiss.IndexFlatL2(dimension)
+        index = faiss.IndexIDMap(base_index)
+        logger.info(f"Created new FAISS IndexIDMap with base index {type(base_index).__name__}")
+        return index
+    except Exception as e:
+        logger.error(f"Error initializing FAISS index: {e}")
+        raise
 
-# Save FAISS index
 def save_index():
-    faiss.write_index(index, index_file)
+    try:
+        faiss.write_index(index, index_file)
+        logger.info("FAISS index saved successfully")
+    except Exception as e:
+        logger.error(f"Error saving FAISS index: {e}")
+        raise
 
-# Add vector
 @app.post("/add_vector")
 async def add_vector(input: VectorInput):
-    vector = embedder.encode([input.text])[0]
-    vector = np.array([vector], dtype=np.float32)
-    global index
-    vector_id = index.ntotal
-    index.add_with_ids(vector, np.array([vector_id], dtype=np.int64))
-    conn = sqlite3.connect(db_file)
-    c = conn.cursor()
-    c.execute("INSERT INTO vectors (id, text, metadata) VALUES (?, ?, ?)",
-              (vector_id, input.text, str(input.metadata)))
-    conn.commit()
-    conn.close()
-    save_index()
-    return {"status": "success", "vector_id": vector_id}
+    try:
+        vector = embedder.encode([input.text])[0]
+        vector = np.array([vector], dtype=np.float32)
+        global index
+        # Insert into SQLite first to get auto-generated ID
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute("INSERT INTO vectors (text, metadata) VALUES (?, ?)",
+                  (input.text, json.dumps(input.metadata)))
+        vector_id = c.lastrowid  # Get SQLite-generated ID
+        conn.commit()
+        conn.close()
+        # Add to FAISS with SQLite ID
+        logger.info(f"Adding vector with id {vector_id}, shape {vector.shape}")
+        index.add_with_ids(vector, np.array([vector_id], dtype=np.int64))
+        save_index()
+        logger.info(f"Added vector with id {vector_id}")
+        return {"status": "success", "vector_id": vector_id}
+    except Exception as e:
+        logger.error(f"Error in add_vector: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Query vectors
 @app.post("/query")
 async def query_vectors(input: QueryInput):
-    query_vector = embedder.encode([input.text])[0]
-    query_vector = np.array([query_vector], dtype=np.float32)
-    distances, indices = index.search(query_vector, input.top_k)
-    results = []
-    conn = sqlite3.connect(db_file)
-    c = conn.cursor()
-    for idx, dist in zip(indices[0], distances[0]):
-        query = "SELECT id, text, metadata FROM vectors WHERE id = ?"
-        params = [int(idx)]
-        if input.metadata_filter:
-            for key, value in input.metadata_filter.items():
-                query += f" AND metadata LIKE ?"
-                params.append(f'%{key}:{value}%')
-        c.execute(query, params)
-        row = c.fetchone()
-        if row:
-            results.append({
-                "id": row[0],
-                "text": row[1],
-                "metadata": eval(row[2]),
-                "distance": float(dist)
-            })
-    conn.close()
-    return {"results": results}
+    try:
+        query_vector = embedder.encode([input.text])[0]
+        query_vector = np.array([query_vector], dtype=np.float32)
+        distances, indices = index.search(query_vector, input.top_k)
+        results = []
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        for idx, dist in zip(indices[0], distances[0]):
+            c.execute("SELECT id, text, metadata FROM vectors WHERE id = ?", (int(idx),))
+            row = c.fetchone()
+            if row:
+                try:
+                    metadata = json.loads(row[2])
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error for id {idx}: {e}")
+                    continue
+                if input.metadata_filter:
+                    if all(str(metadata.get(key)) == str(value) for key, value in input.metadata_filter.items()):
+                        results.append({
+                            "id": row[0],
+                            "text": row[1],
+                            "metadata": metadata,
+                            "distance": float(dist)
+                        })
+                else:
+                    results.append({
+                        "id": row[0],
+                        "text": row[1],
+                        "metadata": metadata,
+                        "distance": float(dist)
+                    })
+        conn.close()
+        logger.info(f"Query returned {len(results)} results")
+        return {"results": results}
+    except Exception as e:
+        logger.error(f"Error in query_vectors: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Delete vector
 @app.delete("/delete_vector/{vector_id}")
 async def delete_vector(vector_id: int):
-    conn = sqlite3.connect(db_file)
-    c = conn.cursor()
-    c.execute("SELECT id FROM vectors WHERE id = ?", (vector_id,))
-    if not c.fetchone():
+    try:
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute("SELECT id FROM vectors WHERE id = ?", (vector_id,))
+        if not c.fetchone():
+            conn.close()
+            raise HTTPException(status_code=404, detail="Vector not found")
+        c.execute("DELETE FROM vectors WHERE id = ?", (vector_id,))
+        conn.commit()
         conn.close()
-        raise HTTPException(status_code=404, detail="Vector not found")
-    c.execute("DELETE FROM vectors WHERE id = ?", (vector_id,))
-    conn.commit()
-    conn.close()
-    index.remove_ids(np.array([vector_id], dtype=np.int64))
-    save_index()
-    return {"status": "success"}
+        index.remove_ids(np.array([vector_id], dtype=np.int64))
+        save_index()
+        logger.info(f"Deleted vector with id {vector_id}")
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Error in delete_vector: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Run the server
+@app.get("/debug_index")
+async def debug_index():
+    return {"total_vectors": index.ntotal}
+
+@app.get("/debug_db")
+async def debug_db():
+    try:
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute("SELECT id, text, metadata FROM vectors")
+        rows = c.fetchall()
+        results = []
+        for row in rows:
+            try:
+                metadata = json.loads(row[2])
+            except json.JSONDecodeError:
+                metadata = {"error": "Invalid JSON"}
+            results.append({"id": row[0], "text": row[1], "metadata": metadata})
+        conn.close()
+        return {"vectors": results}
+    except Exception as e:
+        logger.error(f"Error in debug_db: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
