@@ -1,16 +1,30 @@
-import faiss
+import faiss  # Ensure faiss is imported first
 import numpy as np
 import sqlite3
-import uvicorn
 from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
+import uvicorn
 import os
 
-# Initialize FastAPI app
-app = FastAPI(title="Vector Database API")
+# Lifespan handler for startup and shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    init_index()
+    yield
+    save_index()
 
-# Initialize embedding model (MiniLM for lightweight embeddings)
+# Initialize FastAPI app
+app = FastAPI(title="Vector Database API", lifespan=lifespan)
+
+# Root endpoint to avoid 404
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Vector Database API. Visit /docs for API documentation."}
+
+# Initialize embedding model
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
 # FAISS index parameters
@@ -19,7 +33,7 @@ index_file = "faiss_index.bin"
 index = None
 db_file = "metadata.db"
 
-# Pydantic models for API requests
+# Pydantic models
 class VectorInput(BaseModel):
     text: str
     metadata: dict
@@ -27,6 +41,7 @@ class VectorInput(BaseModel):
 class QueryInput(BaseModel):
     text: str
     top_k: int = 5
+    metadata_filter: dict = None
 
 # Initialize SQLite database
 def init_db():
@@ -39,65 +54,59 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Load or create FAISS index
+# Initialize FAISS index with IndexIDMap
 def init_index():
     global index
     if os.path.exists(index_file):
         index = faiss.read_index(index_file)
     else:
-        index = faiss.IndexFlatL2(dimension)  # L2 distance for simplicity
+        index = faiss.IndexIDMap(faiss.IndexFlatL2(dimension))
     return index
 
-# Save FAISS index to disk
+# Save FAISS index
 def save_index():
     faiss.write_index(index, index_file)
 
-# Add vector to FAISS and metadata to SQLite
+# Add vector
 @app.post("/add_vector")
 async def add_vector(input: VectorInput):
-    # Embed text
     vector = embedder.encode([input.text])[0]
     vector = np.array([vector], dtype=np.float32)
-
-    # Add to FAISS
     global index
     vector_id = index.ntotal
-    index.add(vector)
-
-    # Save metadata to SQLite
+    index.add_with_ids(vector, np.array([vector_id], dtype=np.int64))
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
     c.execute("INSERT INTO vectors (id, text, metadata) VALUES (?, ?, ?)",
               (vector_id, input.text, str(input.metadata)))
     conn.commit()
     conn.close()
-
-    # Save index
     save_index()
     return {"status": "success", "vector_id": vector_id}
 
-# Query FAISS index
+# Query vectors
 @app.post("/query")
 async def query_vectors(input: QueryInput):
-    # Embed query
     query_vector = embedder.encode([input.text])[0]
     query_vector = np.array([query_vector], dtype=np.float32)
-
-    # Search FAISS
     distances, indices = index.search(query_vector, input.top_k)
-
-    # Fetch metadata from SQLite
     results = []
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
     for idx, dist in zip(indices[0], distances[0]):
-        c.execute("SELECT id, text, metadata FROM vectors WHERE id = ?", (int(idx),))
+        query = "SELECT id, text, metadata FROM vectors WHERE id = ?"
+        params = [int(idx)]
+        if input.metadata_filter:
+            for key, value in input.metadata_filter.items():
+                query += f" AND metadata LIKE ?"
+                params.append(f'%{key}:{value}%')
+        c.execute(query, params)
         row = c.fetchone()
         if row:
             results.append({
                 "id": row[0],
                 "text": row[1],
-                "metadata": eval(row[2]),  # Convert string back to dict
+                "metadata": eval(row[2]),
                 "distance": float(dist)
             })
     conn.close()
@@ -106,41 +115,18 @@ async def query_vectors(input: QueryInput):
 # Delete vector
 @app.delete("/delete_vector/{vector_id}")
 async def delete_vector(vector_id: int):
-    # Check if vector exists
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
     c.execute("SELECT id FROM vectors WHERE id = ?", (vector_id,))
     if not c.fetchone():
         conn.close()
         raise HTTPException(status_code=404, detail="Vector not found")
-
-    # Delete from SQLite
     c.execute("DELETE FROM vectors WHERE id = ?", (vector_id,))
     conn.commit()
     conn.close()
-
-    # Rebuild FAISS index (simplified; for production, use incremental updates)
-    global index
-    index = faiss.IndexFlatL2(dimension)
-    conn = sqlite3.connect(db_file)
-    c = conn.cursor()
-    c.execute("SELECT id, text FROM vectors")
-    rows = c.fetchall()
-    vectors = []
-    for row in rows:
-        vector = embedder.encode([row[1]])[0]
-        vectors.append(vector)
-    if vectors:
-        index.add(np.array(vectors, dtype=np.float32))
-    conn.close()
+    index.remove_ids(np.array([vector_id], dtype=np.int64))
     save_index()
     return {"status": "success"}
-
-# Initialize on startup
-@app.on_event("startup")
-async def startup_event():
-    init_db()
-    init_index()
 
 # Run the server
 if __name__ == "__main__":

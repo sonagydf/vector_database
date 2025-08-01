@@ -1,3 +1,7 @@
+import faiss
+import numpy as np
+
+dimension = 128  # Set this to the dimensionality of your vectors
 nlist = 100  # Number of clusters
 quantizer = faiss.IndexFlatL2(dimension)
 index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
