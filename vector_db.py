@@ -64,7 +64,6 @@ def init_db():
 def init_index():
     global index
     try:
-        # Force new index for testing (remove later)
         if os.path.exists(index_file):
             os.remove(index_file)
             logger.info("Deleted existing faiss_index.bin for clean start")
@@ -95,7 +94,7 @@ async def add_vector(input: VectorInput):
         c = conn.cursor()
         c.execute("INSERT INTO vectors (text, metadata) VALUES (?, ?)",
                   (input.text, json.dumps(input.metadata)))
-        vector_id = c.lastrowid  # Get SQLite-generated ID
+        vector_id = c.lastrowid
         conn.commit()
         conn.close()
         # Add to FAISS with SQLite ID
@@ -117,7 +116,11 @@ async def query_vectors(input: QueryInput):
         results = []
         conn = sqlite3.connect(db_file)
         c = conn.cursor()
+        logger.info(f"FAISS search returned indices: {indices[0].tolist()}, distances: {distances[0].tolist()}")
         for idx, dist in zip(indices[0], distances[0]):
+            if idx == -1:
+                logger.warning(f"Invalid index {idx} returned by FAISS")
+                continue
             c.execute("SELECT id, text, metadata FROM vectors WHERE id = ?", (int(idx),))
             row = c.fetchone()
             if row:
@@ -127,6 +130,7 @@ async def query_vectors(input: QueryInput):
                     logger.error(f"JSON decode error for id {idx}: {e}")
                     continue
                 if input.metadata_filter:
+                    # Relaxed comparison: convert both to strings
                     if all(str(metadata.get(key)) == str(value) for key, value in input.metadata_filter.items()):
                         results.append({
                             "id": row[0],
@@ -134,6 +138,7 @@ async def query_vectors(input: QueryInput):
                             "metadata": metadata,
                             "distance": float(dist)
                         })
+                        logger.info(f"Matched vector id {row[0]} with metadata {metadata}")
                 else:
                     results.append({
                         "id": row[0],
@@ -141,6 +146,7 @@ async def query_vectors(input: QueryInput):
                         "metadata": metadata,
                         "distance": float(dist)
                     })
+                    logger.info(f"Matched vector id {row[0]} with metadata {metadata}")
         conn.close()
         logger.info(f"Query returned {len(results)} results")
         return {"results": results}
